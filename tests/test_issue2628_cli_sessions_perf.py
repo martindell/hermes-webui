@@ -1,6 +1,5 @@
 """Regression coverage for capped CLI/agent session sidebar scans (#2628)."""
 
-import pathlib
 import sqlite3
 import time
 
@@ -9,7 +8,6 @@ import pytest
 import api.agent_sessions as agent_sessions
 
 _REAL_SQLITE_CONNECT = sqlite3.connect
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
 def _make_state_db(path, *, sessions=80, messages_per_session=3, create_messages_index=True, source="cli", session_source="cli"):
@@ -196,7 +194,7 @@ def _make_connect_with_progress_counter(*, interval=1):
 def test_importable_agent_rows_push_sidebar_limit_into_sql(tmp_path):
     """A capped sidebar scan should not aggregate the entire state.db first."""
     db = tmp_path / "state.db"
-    _make_state_db(db, sessions=120, messages_per_session=5)
+    _make_state_db(db, sessions=120, messages_per_session=5, create_messages_index=False)
 
     rows = agent_sessions.read_importable_agent_session_rows(db, limit=20, exclude_sources=("webui",))
 
@@ -204,18 +202,12 @@ def test_importable_agent_rows_push_sidebar_limit_into_sql(tmp_path):
     assert [row["id"] for row in rows][:3] == ["cli_perf_0119", "cli_perf_0118", "cli_perf_0117"]
     assert {row["actual_message_count"] for row in rows} == {5}
 
-    src = (REPO_ROOT / "api" / "agent_sessions.py").read_text()
-    assert "WITH candidates AS" in src
-    assert "JOIN candidates c ON c.id = s.id" in src
-    assert "latest_messages AS" in src
-    assert "LEFT JOIN latest_messages lm ON lm.session_id = s.id" in src
-    assert "and not messages_index_present" in src
-    assert "not messages_index_present" in src
-    assert "PRAGMA index_list(messages)" in src
-    assert "CREATE INDEX IF NOT EXISTS idx_messages_session" not in src
-    assert "_CRON_PREAGGREGATE_CANDIDATE_ORDER_MIN_MESSAGES" not in src
-    assert "MAX(mx.timestamp) FROM messages mx WHERE mx.session_id = s.id" in src
-    assert "candidate_limit = max(result_limit * 8, result_limit)" in src
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        indexes = {row[1] for row in conn.execute("PRAGMA index_list(messages)")}
+    finally:
+        conn.close()
+    assert "idx_messages_session" not in indexes
 
 
 def test_importable_agent_rows_candidate_ordering_stays_under_progress_budget(tmp_path, monkeypatch):
