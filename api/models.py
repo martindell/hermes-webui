@@ -7832,15 +7832,6 @@ def _load_cli_sessions_uncached(
         # (especially kanban) from evicting every CLI/TUI/ACP conversation.
         exclude_sources=("cron", "webhook", "kanban") if source_filter is None else None,
         include_sources=None if source_filter is None else (source_filter,),
-        # This projection feeds the CLI-sessions CACHE. A read-only open failure
-        # must NOT look like "no sessions": returning [] here would let
-        # _cache_cli_sessions_if_current() overwrite a known-good cache and blank
-        # the sidebar on a transient failure (reproduced with EMFILE). Raising
-        # instead routes the failure to the stale-cache handler in
-        # _load_cli_sessions_with_stale_fallback(), which returns the previous
-        # projection. Deliberately NOT a writable fallback — the whole point of
-        # this projection is that it never opens state.db for writing.
-        raise_on_unavailable=True,
     ):
         sid = row['id']
         raw_ts = row['last_activity'] or row['started_at']
