@@ -355,6 +355,25 @@ def test_periodic_projection_recovers_role_only_sidebar_visibility_change(tmp_pa
     assert subscriber.empty()
 
 
+def test_legacy_message_schema_still_runs_full_projection_when_fingerprint_missing(
+    tmp_path, monkeypatch
+):
+    gw = importlib.import_module("api.gateway_watcher")
+    db, conn = _make_db(tmp_path)
+    conn.close()
+    legacy_rows = [{"session_id": "legacy-1", "title": "Legacy session"}]
+    monkeypatch.setattr(gw, "_cheap_change_fingerprint", lambda _path: None)
+    monkeypatch.setattr(gw, "_get_agent_sessions_from_db", lambda _path: legacy_rows)
+
+    watcher = gw.GatewayWatcher(state_db_path=db)
+    subscriber = watcher.subscribe()
+
+    assert watcher._poll_once(now=1.0) is True
+    assert subscriber.get_nowait()["sessions"] == legacy_rows
+    assert watcher._last_sessions == legacy_rows
+    assert watcher._last_cheap_fp == ""
+
+
 def test_initial_missing_db_does_not_publish_an_empty_snapshot(tmp_path):
     gw = importlib.import_module("api.gateway_watcher")
     watcher = gw.GatewayWatcher(state_db_path=tmp_path / "missing.db")
@@ -491,7 +510,7 @@ def test_projection_open_failure_after_fingerprint_preserves_state_and_retries(
     assert watcher._last_full_projection_at == 3.0
 
 
-def test_fingerprint_failure_preserves_populated_state(tmp_path, monkeypatch):
+def test_fingerprint_missing_still_runs_projection_and_preserves_cheap_state(tmp_path, monkeypatch):
     gw = importlib.import_module("api.gateway_watcher")
     db, conn = _make_db(tmp_path)
     _add_session(conn, "tg1", "telegram", mc=2)
@@ -506,11 +525,12 @@ def test_fingerprint_failure_preserves_populated_state(tmp_path, monkeypatch):
     initial_fingerprint = watcher._last_cheap_fp
 
     monkeypatch.setattr(gw, "_cheap_change_fingerprint", lambda _path: None)
-    assert watcher._poll_once(now=2.0) is False
+    assert watcher._poll_once(now=2.0) is True
     assert subscriber.empty()
     assert watcher._last_sessions is initial_sessions
     assert watcher._last_hash == initial_hash
     assert watcher._last_cheap_fp == initial_fingerprint
+    assert watcher._last_full_projection_at == 2.0
 
 
 def test_cheap_fingerprint_detects_lineage_only_change(tmp_path):

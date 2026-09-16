@@ -81,6 +81,10 @@ _CLI_SESSIONS_CACHE_INVALIDATION_VERSION = 0
 # _CLAUDE_CODE_PARSE_CACHE / _SIDECAR_METADATA_CACHE LRU pattern.
 _CLI_SESSIONS_CACHE: "collections.OrderedDict[tuple, tuple]" = collections.OrderedDict()
 _CLI_SESSIONS_CACHE_MAX_ENTRIES = 8
+# Last successful projection by a stable identity. The normal cache key includes
+# volatile state.db fingerprints, so an unavailable DB can otherwise make the
+# known-good entry unfindable. Values are (invalidation generation, rows).
+_CLI_SESSIONS_LAST_KNOWN_GOOD: "dict[tuple, tuple]" = {}
 _CLI_SESSIONS_CACHE_WAIT_SECONDS = 0.25
 # Event waits that keep stale rows visible while a rebuild is in flight.
 _CLI_SESSIONS_CACHE_STALE_WAIT_SECONDS = 0.10
@@ -7210,6 +7214,7 @@ def clear_cli_sessions_cache() -> None:
         global _CLI_SESSIONS_CACHE_INVALIDATION_VERSION
         _CLI_SESSIONS_CACHE_INVALIDATION_VERSION += 1
         _CLI_SESSIONS_CACHE.clear()
+        _CLI_SESSIONS_LAST_KNOWN_GOOD.clear()
     # The sidecar-metadata projection cache is stat-keyed (self-invalidating on
     # any file change), but clear it alongside the CLI cache so an explicit
     # reset — a mutating sidebar action or test isolation — starts fully cold.
@@ -7245,6 +7250,28 @@ def _cli_sessions_cache_done(cache_key: tuple, event: threading.Event | None) ->
         event.set()
 
 
+def _cli_sessions_stable_cache_identity(cache_key: tuple) -> tuple:
+    """Remove volatile state.db revisions from a CLI cache identity."""
+    if cache_key and cache_key[0] == 'all_profiles':
+        context_key = cache_key[3]
+        if isinstance(context_key, tuple) and context_key and context_key[0] != 'streaming-frozen':
+            context_key = tuple(
+                tuple(entry[:2]) if isinstance(entry, tuple) and len(entry) >= 2 else entry
+                for entry in context_key
+            )
+        return (*cache_key[:3], context_key, *cache_key[4:])
+    # Single-profile keys place the volatile DB fingerprint at index 4.
+    return (*cache_key[:4], *cache_key[5:]) if len(cache_key) > 4 else cache_key
+
+
+def _copy_last_known_good_cli_sessions(stable_key: tuple, invalidation_stamp: int):
+    with _CLI_SESSIONS_CACHE_LOCK:
+        entry = _CLI_SESSIONS_LAST_KNOWN_GOOD.get(stable_key)
+        if entry is None or entry[0] != invalidation_stamp:
+            return None
+        return _copy_cli_sessions(entry[1])
+
+
 def _cache_cli_sessions_if_current(
     cache_key: tuple,
     ttl: float,
@@ -7254,10 +7281,15 @@ def _cache_cli_sessions_if_current(
     with _CLI_SESSIONS_CACHE_LOCK:
         if _CLI_SESSIONS_CACHE_INVALIDATION_VERSION != invalidation_stamp:
             return False
+        copied_sessions = _copy_cli_sessions(sessions)
         _CLI_SESSIONS_CACHE[cache_key] = (
             time.monotonic() + ttl,
             invalidation_stamp,
-            _copy_cli_sessions(sessions),
+            copied_sessions,
+        )
+        _CLI_SESSIONS_LAST_KNOWN_GOOD[_cli_sessions_stable_cache_identity(cache_key)] = (
+            invalidation_stamp,
+            _copy_cli_sessions(copied_sessions),
         )
         _CLI_SESSIONS_CACHE.move_to_end(cache_key)
         while len(_CLI_SESSIONS_CACHE) > _CLI_SESSIONS_CACHE_MAX_ENTRIES:
@@ -7296,6 +7328,7 @@ def _load_and_cache_cli_sessions(
     all_profiles: bool,
     db_path,
 ) -> list:
+    stable_cache_key = _cli_sessions_stable_cache_identity(cache_key)
     try:
         sessions = load_sessions()
     except Exception as _cli_err:
@@ -7305,6 +7338,12 @@ def _load_and_cache_cli_sessions(
         )
         if stale_sessions is not None and stale_stamp == _cli_sessions_cache_invalidation_stamp():
             return stale_sessions
+        stable_sessions = _copy_last_known_good_cli_sessions(
+            stable_cache_key,
+            invalidation_stamp,
+        )
+        if stable_sessions is not None:
+            return stable_sessions
         return []
     _cache_cli_sessions_if_current(
         cache_key,
