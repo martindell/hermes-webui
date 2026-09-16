@@ -246,6 +246,7 @@ def test_get_cli_sessions_all_profiles_preserves_last_known_good_rows_when_db_fa
     assert calls == 2
 
 
+def test_session_import_cli_returns_read_only_claude_code_payload(monkeypatch, tmp_path):
     import api.routes as routes
 
     sid = "claude_code_fixture"
