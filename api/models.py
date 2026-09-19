@@ -7328,6 +7328,12 @@ def _copy_fresh_cli_sessions_cache_entry(cache_key: tuple):
         return _copy_cli_sessions(cached_sessions)
 
 
+@dataclass(frozen=True)
+class _CliSessionsLoadResult:
+    sessions: list
+    complete: bool = True
+
+
 def _load_and_cache_cli_sessions(
     *,
     cache_key: tuple,
@@ -7341,7 +7347,13 @@ def _load_and_cache_cli_sessions(
 ) -> list:
     stable_cache_key = _cli_sessions_stable_cache_identity(cache_key)
     try:
-        sessions = load_sessions()
+        loaded = load_sessions()
+        if isinstance(loaded, _CliSessionsLoadResult):
+            sessions = loaded.sessions
+            complete = loaded.complete
+        else:
+            sessions = loaded
+            complete = True
     except Exception as _cli_err:
         logger.warning(
             "get_cli_sessions() failed — check state.db schema or path (%s): %s",
@@ -7356,6 +7368,16 @@ def _load_and_cache_cli_sessions(
         if stable_sessions is not None:
             return stable_sessions
         return []
+    if not complete:
+        stable_sessions = _copy_last_known_good_cli_sessions(
+            stable_cache_key,
+            invalidation_stamp,
+        )
+        if stable_sessions is not None:
+            return stable_sessions
+        # No complete snapshot exists yet. Expose this attempt to the caller,
+        # but never publish a partial aggregate as authoritative cache state.
+        return _copy_cli_sessions(sessions)
     _cache_cli_sessions_if_current(
         cache_key,
         ttl,
@@ -8181,6 +8203,7 @@ def get_cli_sessions(
     bridge is purely additive and never crashes the WebUI.
     """
     source_filter = _normalize_cli_session_source_filter(source_filter)
+    contexts = []
     if all_profiles:
         contexts, context_cache_key = _all_profiles_cli_contexts()
         stable_context_cache_key = tuple(
@@ -8220,14 +8243,15 @@ def get_cli_sessions(
     ttl = _cli_sessions_cache_ttl_seconds()
     now = time.monotonic()
 
-    def _load_sessions():
+    def _load_sessions() -> list | _CliSessionsLoadResult:
         loader_supports_include_claude_code = _callable_accepts_include_claude_code(
             _load_cli_sessions_uncached
         )
         if all_profiles:
             merged: list[dict] = []
             unavailable_error = None
-            for idx, (ctx_home, ctx_db_path, ctx_profile) in enumerate(contexts):
+            successful_profiles = 0
+            for ctx_home, ctx_db_path, ctx_profile in contexts:
                 load_kwargs = {
                     'source_filter': source_filter,
                     'visible_session_limit': None,
@@ -8236,29 +8260,46 @@ def get_cli_sessions(
                     'kanban_project_limit': None,
                 }
                 if loader_supports_include_claude_code:
-                    load_kwargs['include_claude_code'] = include_claude_code and idx == 0
+                    # Claude Code is global rather than profile-owned; scan it
+                    # once below so profile 0 availability cannot suppress it.
+                    load_kwargs['include_claude_code'] = False
                 try:
-                    merged.extend(
-                        _load_cli_sessions_uncached(
-                            ctx_home,
-                            ctx_db_path,
-                            ctx_profile,
-                            **load_kwargs,
-                        )
+                    profile_rows = _load_cli_sessions_uncached(
+                        ctx_home,
+                        ctx_db_path,
+                        ctx_profile,
+                        **load_kwargs,
                     )
+                    merged.extend(profile_rows)
+                    successful_profiles += 1
                 except (OSError, sqlite3.Error) as _profile_err:
                     # One unavailable profile must not erase fresh rows from
-                    # healthy profiles. If every profile fails, re-raise so the
-                    # aggregate last-known-good fallback remains authoritative.
+                    # healthy profiles. The explicit completeness bit prevents
+                    # this partial aggregate from entering either cache.
                     unavailable_error = _profile_err
                     logger.warning(
                         "get_cli_sessions() skipped unavailable profile %s: %s",
                         ctx_profile or 'default',
                         _profile_err,
                     )
-            if unavailable_error is not None and not merged:
-                raise unavailable_error
-            return merged
+            external_complete = True
+            if include_claude_code:
+                try:
+                    merged.extend(get_claude_code_sessions())
+                except Exception as _claude_err:
+                    external_complete = False
+                    logger.warning(
+                        "get_cli_sessions() Claude Code scan failed: %s",
+                        _claude_err,
+                    )
+            return _CliSessionsLoadResult(
+                merged,
+                complete=(
+                    unavailable_error is None
+                    and successful_profiles == len(contexts)
+                    and external_complete
+                ),
+            )
         load_kwargs = {'source_filter': source_filter}
         if loader_supports_include_claude_code:
             load_kwargs['include_claude_code'] = include_claude_code
@@ -8316,7 +8357,8 @@ def get_cli_sessions(
         )
 
     try:
-        return _load_sessions()
+        loaded = _load_sessions()
+        return loaded.sessions if isinstance(loaded, _CliSessionsLoadResult) else loaded
     except Exception as _cli_err:
         logger.warning(
             "get_cli_sessions() failed — check state.db schema or path (%s): %s",

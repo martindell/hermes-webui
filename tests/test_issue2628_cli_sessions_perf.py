@@ -391,6 +391,123 @@ def test_cache_owned_source_pass_failure_does_not_publish_partial_rows(tmp_path,
 
 
 
+
+
+def test_all_profiles_partial_result_never_poison_ttl_or_stable_cache(monkeypatch, tmp_path):
+    """A+B warm -> A-only partial -> recovery must retain complete authority."""
+    homes = [tmp_path / "a", tmp_path / "b"]
+    for home in homes:
+        home.mkdir()
+    revision = ["warm"]
+    mode = ["warm"]
+    calls = []
+
+    def contexts():
+        return (
+            [(homes[0], homes[0] / "state.db", "a"), (homes[1], homes[1] / "state.db", "b")],
+            ((str(homes[0]), "a", revision[0]), (str(homes[1]), "b", revision[0])),
+        )
+
+    monkeypatch.setattr(models, "_all_profiles_cli_contexts", contexts)
+    monkeypatch.setattr(models, "_default_claude_code_projects_dir", lambda: None)
+    monkeypatch.setattr(models, "get_claude_code_sessions", lambda: [])
+    monkeypatch.setattr(models, "_CLI_SESSIONS_CACHE_TTL_SECONDS", 60.0, raising=False)
+    models.clear_cli_sessions_cache()
+
+    def load(_home, _db_path, profile, **_kwargs):
+        calls.append((mode[0], profile))
+        if mode[0] == "partial" and profile == "b":
+            raise OSError("profile b unavailable")
+        if mode[0] == "failed":
+            raise OSError(f"profile {profile} unavailable")
+        return [{"session_id": f"session-{profile}", "profile": profile}]
+
+    monkeypatch.setattr(models, "_load_cli_sessions_uncached", load)
+    complete = [
+        {"session_id": "session-a", "profile": "a"},
+        {"session_id": "session-b", "profile": "b"},
+    ]
+    assert models.get_cli_sessions(all_profiles=True) == complete
+
+    mode[0] = "partial"
+    revision[0] = "partial"
+    assert models.get_cli_sessions(all_profiles=True) == complete
+
+    mode[0] = "warm"
+    # Same fingerprint/key as the partial attempt: it must rebuild because the
+    # incomplete result was not published to the TTL cache.
+    assert models.get_cli_sessions(all_profiles=True) == complete
+
+    mode[0] = "failed"
+    revision[0] = "failed"
+    assert models.get_cli_sessions(all_profiles=True) == complete
+    assert calls.count(("partial", "b")) == 1
+
+
+def test_all_profiles_empty_success_counts_as_success(monkeypatch, tmp_path):
+    """A healthy profile returning [] is success, not an all-failed signal."""
+    homes = [tmp_path / "a", tmp_path / "b"]
+    for home in homes:
+        home.mkdir()
+    revision = ["same"]
+    mode = ["partial"]
+    monkeypatch.setattr(
+        models,
+        "_all_profiles_cli_contexts",
+        lambda: (
+            [(homes[0], homes[0] / "state.db", "a"), (homes[1], homes[1] / "state.db", "b")],
+            ((str(homes[0]), "a", revision[0]), (str(homes[1]), "b", revision[0])),
+        ),
+    )
+    monkeypatch.setattr(models, "_default_claude_code_projects_dir", lambda: None)
+    monkeypatch.setattr(models, "get_claude_code_sessions", lambda: [])
+    monkeypatch.setattr(models, "_CLI_SESSIONS_CACHE_TTL_SECONDS", 60.0, raising=False)
+    models.clear_cli_sessions_cache()
+
+    def load(_home, _db_path, profile, **_kwargs):
+        if profile == "a":
+            return []
+        if mode[0] == "partial":
+            raise OSError("profile b unavailable")
+        return [{"session_id": "b"}]
+
+    monkeypatch.setattr(models, "_load_cli_sessions_uncached", load)
+    assert models.get_cli_sessions(all_profiles=True) == []
+    mode[0] = "recovered"
+    assert models.get_cli_sessions(all_profiles=True) == [{"session_id": "b"}]
+
+
+def test_all_profiles_scans_global_claude_when_first_profile_unavailable(monkeypatch, tmp_path):
+    """Profile 0 failure must not suppress the independent Claude scan."""
+    homes = [tmp_path / "a", tmp_path / "b"]
+    for home in homes:
+        home.mkdir()
+    monkeypatch.setattr(
+        models,
+        "_all_profiles_cli_contexts",
+        lambda: (
+            [(homes[0], homes[0] / "state.db", "a"), (homes[1], homes[1] / "state.db", "b")],
+            ((str(homes[0]), "a", "same"), (str(homes[1]), "b", "same")),
+        ),
+    )
+    monkeypatch.setattr(models, "_default_claude_code_projects_dir", lambda: None)
+    monkeypatch.setattr(models, "get_claude_code_sessions", lambda: [{"session_id": "claude-1"}])
+    monkeypatch.setattr(models, "_CLI_SESSIONS_CACHE_TTL_SECONDS", 0.0, raising=False)
+    monkeypatch.setattr(
+        models,
+        "_load_cli_sessions_uncached",
+        lambda _home, _db_path, profile, **_kwargs: (
+            (_ for _ in ()).throw(OSError("profile a unavailable"))
+            if profile == "a"
+            else [{"session_id": "profile-b"}]
+        ),
+    )
+    assert models.get_cli_sessions(all_profiles=True) == [
+        {"session_id": "profile-b"},
+        {"session_id": "claude-1"},
+    ]
+
+
 def test_all_profiles_keeps_healthy_profile_when_another_is_unavailable(monkeypatch, tmp_path):
     """An unavailable profile must not hide rows loaded from healthy profiles."""
     home_a = tmp_path / "profile-a"
