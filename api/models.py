@@ -8226,6 +8226,7 @@ def get_cli_sessions(
         )
         if all_profiles:
             merged: list[dict] = []
+            unavailable_error = None
             for idx, (ctx_home, ctx_db_path, ctx_profile) in enumerate(contexts):
                 load_kwargs = {
                     'source_filter': source_filter,
@@ -8236,14 +8237,27 @@ def get_cli_sessions(
                 }
                 if loader_supports_include_claude_code:
                     load_kwargs['include_claude_code'] = include_claude_code and idx == 0
-                merged.extend(
-                    _load_cli_sessions_uncached(
-                        ctx_home,
-                        ctx_db_path,
-                        ctx_profile,
-                        **load_kwargs,
+                try:
+                    merged.extend(
+                        _load_cli_sessions_uncached(
+                            ctx_home,
+                            ctx_db_path,
+                            ctx_profile,
+                            **load_kwargs,
+                        )
                     )
-                )
+                except (OSError, sqlite3.Error) as _profile_err:
+                    # One unavailable profile must not erase fresh rows from
+                    # healthy profiles. If every profile fails, re-raise so the
+                    # aggregate last-known-good fallback remains authoritative.
+                    unavailable_error = _profile_err
+                    logger.warning(
+                        "get_cli_sessions() skipped unavailable profile %s: %s",
+                        ctx_profile or 'default',
+                        _profile_err,
+                    )
+            if unavailable_error is not None and not merged:
+                raise unavailable_error
             return merged
         load_kwargs = {'source_filter': source_filter}
         if loader_supports_include_claude_code:

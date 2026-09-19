@@ -389,6 +389,34 @@ def test_cache_owned_source_pass_failure_does_not_publish_partial_rows(tmp_path,
     assert opens == 2
 
 
+
+
+def test_all_profiles_keeps_healthy_profile_when_another_is_unavailable(monkeypatch, tmp_path):
+    """An unavailable profile must not hide rows loaded from healthy profiles."""
+    home_a = tmp_path / "profile-a"
+    home_b = tmp_path / "profile-b"
+    home_a.mkdir()
+    home_b.mkdir()
+    contexts = lambda: (
+        [(home_a, home_a / "state.db", "a"), (home_b, home_b / "state.db", "b")],
+        ((str(home_a), "a", "a-rev"), (str(home_b), "b", "b-rev")),
+    )
+    monkeypatch.setattr(models, "_all_profiles_cli_contexts", contexts)
+    monkeypatch.setattr(models, "_default_claude_code_projects_dir", lambda: None)
+    monkeypatch.setattr(models, "get_claude_code_sessions", lambda: [])
+    monkeypatch.setattr(models, "_CLI_SESSIONS_CACHE_TTL_SECONDS", 0.0, raising=False)
+
+    def load(home, _db_path, profile, **_kwargs):
+        if profile == "b":
+            raise OSError("profile b state.db unavailable")
+        return [{"session_id": "healthy-a", "profile": "a"}]
+
+    monkeypatch.setattr(models, "_load_cli_sessions_uncached", load)
+    assert models.get_cli_sessions(all_profiles=True) == [
+        {"session_id": "healthy-a", "profile": "a"}
+    ]
+
+
 def test_all_profiles_idle_and_streaming_fallback_share_stable_identity(monkeypatch, tmp_path):
     """Idle and streaming-frozen all-profile failures share last-known-good rows."""
     home = tmp_path / "home"
