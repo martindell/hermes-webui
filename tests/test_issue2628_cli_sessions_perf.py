@@ -6,6 +6,7 @@ import time
 import pytest
 
 import api.agent_sessions as agent_sessions
+import api.models as models
 
 _REAL_SQLITE_CONNECT = sqlite3.connect
 
@@ -313,3 +314,112 @@ def test_importable_agent_rows_zero_limit_skips_query_work(tmp_path):
     _make_state_db(db, sessions=5, messages_per_session=1)
 
     assert agent_sessions.read_importable_agent_session_rows(db, limit=0, exclude_sources=("webui",)) == []
+
+
+def test_cache_owned_projection_preserves_rows_when_real_open_fails(tmp_path, monkeypatch):
+    """A real read-only open failure must reach the stale-cache fallback."""
+    db = tmp_path / "state.db"
+    _make_state_db(db, sessions=1, messages_per_session=1, source="cli", session_source="cli")
+    home = tmp_path / "home"
+    home.mkdir()
+    revision = ["warm"]
+    monkeypatch.setattr(models, "_CLI_SESSIONS_CACHE_TTL_SECONDS", 0.001, raising=False)
+    monkeypatch.setattr(models, "get_claude_code_sessions", lambda: [])
+    monkeypatch.setattr(models, "_default_claude_code_projects_dir", lambda: None)
+    monkeypatch.setattr(
+        models,
+        "_resolve_cli_sessions_context",
+        lambda _source_filter=None, **_kwargs: (
+            home,
+            db,
+            "default",
+            (str(home), "default", str(db), "", revision[0], False, None, None, None),
+        ),
+    )
+    models.clear_cli_sessions_cache()
+
+    warm = models.get_cli_sessions()
+    assert [row["session_id"] for row in warm] == ["cli_perf_0000"]
+
+    def fail_open(*_args, **_kwargs):
+        raise OSError("state.db temporarily unavailable")
+
+    monkeypatch.setattr(agent_sessions, "open_state_db_readonly", fail_open)
+    revision[0] = "failed"
+    assert models.get_cli_sessions() == warm
+
+
+def test_cache_owned_source_pass_failure_does_not_publish_partial_rows(tmp_path, monkeypatch):
+    """A source-specific open failure must not cache the earlier partial pass."""
+    db = tmp_path / "state.db"
+    _make_state_db(db, sessions=1, messages_per_session=1, source="cron", session_source="cron")
+    home = tmp_path / "home"
+    home.mkdir()
+    revision = ["warm"]
+    monkeypatch.setattr(models, "_CLI_SESSIONS_CACHE_TTL_SECONDS", 0.001, raising=False)
+    monkeypatch.setattr(models, "get_claude_code_sessions", lambda: [])
+    monkeypatch.setattr(models, "_default_claude_code_projects_dir", lambda: None)
+    monkeypatch.setattr(
+        models,
+        "_resolve_cli_sessions_context",
+        lambda _source_filter=None, **_kwargs: (
+            home,
+            db,
+            "default",
+            (str(home), "default", str(db), "", revision[0], False, None, None, None),
+        ),
+    )
+    models.clear_cli_sessions_cache()
+    warm = models.get_cli_sessions()
+    assert [row["session_id"] for row in warm] == ["cli_perf_0000"]
+
+    real_open = agent_sessions.open_state_db_readonly
+    opens = 0
+
+    def fail_second_open(*args, **kwargs):
+        nonlocal opens
+        opens += 1
+        if opens == 2:
+            raise OSError("state.db disappeared during cron pass")
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(agent_sessions, "open_state_db_readonly", fail_second_open)
+    revision[0] = "failed"
+    assert models.get_cli_sessions() == warm
+    assert opens == 2
+
+
+def test_all_profiles_idle_and_streaming_fallback_share_stable_identity(monkeypatch, tmp_path):
+    """Idle and streaming-frozen all-profile failures share last-known-good rows."""
+    home = tmp_path / "home"
+    home.mkdir()
+    db = home / "state.db"
+    db.write_text("placeholder", encoding="utf-8")
+    marker: list[object] = [None]
+    revision = ["warm"]
+    calls = 0
+    rows = [{"session_id": "all-profile-1", "title": "Known good"}]
+    contexts = lambda: ([(home, db, "default")], ((str(home), "default", revision[0]),))
+    monkeypatch.setattr(models, "_all_profiles_cli_contexts", contexts)
+    monkeypatch.setattr(models, "_default_claude_code_projects_dir", lambda: None)
+    monkeypatch.setattr(models, "get_claude_code_sessions", lambda: [])
+    monkeypatch.setattr(models, "_cli_sessions_streaming_freeze_marker", lambda: marker[0])
+    monkeypatch.setattr(models, "_CLI_SESSIONS_CACHE_TTL_SECONDS", 0.001, raising=False)
+
+    def load(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise OSError("all-profile state.db unavailable")
+        return list(rows)
+
+    monkeypatch.setattr(models, "_load_cli_sessions_uncached", load)
+    models.clear_cli_sessions_cache()
+    assert models.get_cli_sessions(all_profiles=True) == rows
+    revision[0] = "streaming"
+    marker[0] = ("streaming", ("session-1",))
+    assert models.get_cli_sessions(all_profiles=True) == rows
+    revision[0] = "idle-again"
+    marker[0] = None
+    assert models.get_cli_sessions(all_profiles=True) == rows
+    assert calls == 3

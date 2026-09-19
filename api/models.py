@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import re
+import sqlite3
 import threading
 import time
 import uuid
@@ -7257,13 +7258,9 @@ def _cli_sessions_cache_done(cache_key: tuple, event: threading.Event | None) ->
 def _cli_sessions_stable_cache_identity(cache_key: tuple) -> tuple:
     """Remove volatile state.db revisions from a CLI cache identity."""
     if cache_key and cache_key[0] == 'all_profiles':
-        context_key = cache_key[3]
-        if isinstance(context_key, tuple) and context_key and context_key[0] != 'streaming-frozen':
-            context_key = tuple(
-                tuple(entry[:2]) if isinstance(entry, tuple) and len(entry) >= 2 else entry
-                for entry in context_key
-            )
-        return (*cache_key[:3], context_key, *cache_key[4:])
+        # Index 4 is the explicit profile-home/profile-name ownership key. It
+        # stays stable across idle and streaming-frozen primary cache modes.
+        return (*cache_key[:3], cache_key[4], *cache_key[5:])
     # Single-profile keys place the volatile DB fingerprint at index 4.
     return (*cache_key[:4], *cache_key[5:]) if len(cache_key) > 4 else cache_key
 
@@ -7885,6 +7882,7 @@ def _load_cli_sessions_uncached(
         # (especially kanban) from evicting every CLI/TUI/ACP conversation.
         exclude_sources=("cron", "webhook", "kanban") if source_filter is None else None,
         include_sources=None if source_filter is None else (source_filter,),
+        raise_on_unavailable=True,
     ):
         sid = row['id']
         raw_ts = row['last_activity'] or row['started_at']
@@ -7972,6 +7970,7 @@ def _load_cli_sessions_uncached(
                 log=logger,
                 exclude_sources=None,
                 include_sources=("cron",),
+                raise_on_unavailable=True,
             ):
                 sid = row['id']
                 if sid in existing_sids:
@@ -8025,6 +8024,8 @@ def _load_cli_sessions_uncached(
                     'is_cli_session': is_cli_session_row(row),
                 })
                 existing_sids.add(sid)
+        except (OSError, sqlite3.Error):
+            raise
         except Exception:
             logger.debug("Cron project-chip second pass failed", exc_info=True)
 
@@ -8040,6 +8041,7 @@ def _load_cli_sessions_uncached(
                 log=logger,
                 exclude_sources=None,
                 include_sources=("webhook",),
+                raise_on_unavailable=True,
             ):
                 sid = row['id']
                 if sid in existing_sids:
@@ -8091,6 +8093,8 @@ def _load_cli_sessions_uncached(
                     'is_cli_session': is_cli_session_row({**row, **_source_meta}),
                 })
                 existing_sids.add(sid)
+        except (OSError, sqlite3.Error):
+            raise
         except Exception:
             logger.debug("Webhook project-chip second pass failed", exc_info=True)
 
@@ -8105,6 +8109,7 @@ def _load_cli_sessions_uncached(
                 log=logger,
                 exclude_sources=None,
                 include_sources=("kanban",),
+                raise_on_unavailable=True,
             ):
                 sid = row['id']
                 if sid in existing_sids:
@@ -8155,6 +8160,8 @@ def _load_cli_sessions_uncached(
                     'is_cli_session': is_cli_session_row({**row, **_source_meta}),
                 })
                 existing_sids.add(sid)
+        except (OSError, sqlite3.Error):
+            raise
         except Exception:
             logger.debug("Kanban sidebar second pass failed", exc_info=True)
 
@@ -8176,6 +8183,10 @@ def get_cli_sessions(
     source_filter = _normalize_cli_session_source_filter(source_filter)
     if all_profiles:
         contexts, context_cache_key = _all_profiles_cli_contexts()
+        stable_context_cache_key = tuple(
+            (_path_cache_key(ctx_home), str(ctx_profile or 'default'))
+            for ctx_home, _ctx_db_path, ctx_profile in contexts
+        )
         db_path = "all profiles"
         # #4842: freeze the volatile per-profile state.db component while
         # streaming so a streamed message row in one profile doesn't bust the
@@ -8188,6 +8199,7 @@ def get_cli_sessions(
             source_filter or '',
             bool(include_claude_code),
             context_cache_key,
+            stable_context_cache_key,
             _path_cache_key(_default_claude_code_projects_dir()),
             _path_stat_cache_key(_default_claude_code_projects_dir()),
             _path_stat_cache_key(SESSION_INDEX_FILE),
