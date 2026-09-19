@@ -508,6 +508,54 @@ def test_all_profiles_scans_global_claude_when_first_profile_unavailable(monkeyp
     ]
 
 
+
+
+def test_all_profiles_incomplete_load_prefers_stale_primary_over_evicted_lkg(monkeypatch, tmp_path):
+    """A complete expired primary remains usable when its LKG twin was evicted."""
+    home = tmp_path / "home"
+    home.mkdir()
+    mode = ["warm"]
+    monkeypatch.setattr(models, "_all_profiles_cli_contexts", lambda: (
+        [(home, home / "state.db", "default")],
+        ((str(home), "default", "warm"),),
+    ))
+    monkeypatch.setattr(models, "_default_claude_code_projects_dir", lambda: None)
+    monkeypatch.setattr(models, "get_claude_code_sessions", lambda: [])
+    monkeypatch.setattr(models, "_CLI_SESSIONS_CACHE_TTL_SECONDS", 60.0, raising=False)
+    models.clear_cli_sessions_cache()
+    rows = [{"session_id": "complete"}]
+    monkeypatch.setattr(models, "_load_cli_sessions_uncached", lambda *_a, **_k: (
+        rows if mode[0] == "warm" else (_ for _ in ()).throw(OSError("unavailable"))
+    ))
+    assert models.get_cli_sessions(all_profiles=True) == rows
+    cache_key = next(k for k in models._CLI_SESSIONS_CACHE if k[0] == "all_profiles")
+    with models._CLI_SESSIONS_CACHE_LOCK:
+        expires, stamp, cached = models._CLI_SESSIONS_CACHE[cache_key]
+        models._CLI_SESSIONS_CACHE[cache_key] = (0.0, stamp, cached)
+        models._CLI_SESSIONS_LAST_KNOWN_GOOD.clear()
+    assert models.get_cli_sessions(all_profiles=True) == rows
+
+
+def test_all_profiles_filtered_load_excludes_global_claude_on_first_load_and_cache_hit(monkeypatch, tmp_path):
+    """Profile-source filters must not admit global Claude rows."""
+    home = tmp_path / "home"
+    home.mkdir()
+    claude_calls = []
+    monkeypatch.setattr(models, "_all_profiles_cli_contexts", lambda: (
+        [(home, home / "state.db", "default")],
+        ((str(home), "default", "same"),),
+    ))
+    monkeypatch.setattr(models, "_default_claude_code_projects_dir", lambda: None)
+    monkeypatch.setattr(models, "_CLI_SESSIONS_CACHE_TTL_SECONDS", 60.0, raising=False)
+    models.clear_cli_sessions_cache()
+    monkeypatch.setattr(models, "get_claude_code_sessions", lambda: claude_calls.append(1) or [{"session_id": "claude"}])
+    monkeypatch.setattr(models, "_load_cli_sessions_uncached", lambda *_a, **_k: [{"session_id": "cron", "source": "cron"}])
+    expected = [{"session_id": "cron", "source": "cron"}]
+    assert models.get_cli_sessions("cron", all_profiles=True) == expected
+    assert models.get_cli_sessions("cron", all_profiles=True) == expected
+    assert claude_calls == []
+
+
 def test_all_profiles_keeps_healthy_profile_when_another_is_unavailable(monkeypatch, tmp_path):
     """An unavailable profile must not hide rows loaded from healthy profiles."""
     home_a = tmp_path / "profile-a"

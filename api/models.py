@@ -7369,6 +7369,8 @@ def _load_and_cache_cli_sessions(
             return stable_sessions
         return []
     if not complete:
+        if stale_sessions is not None and stale_stamp == _cli_sessions_cache_invalidation_stamp():
+            return stale_sessions
         stable_sessions = _copy_last_known_good_cli_sessions(
             stable_cache_key,
             invalidation_stamp,
@@ -8283,7 +8285,7 @@ def get_cli_sessions(
                         _profile_err,
                     )
             external_complete = True
-            if include_claude_code:
+            if include_claude_code and source_filter in (None, CLAUDE_CODE_SOURCE):
                 try:
                     merged.extend(get_claude_code_sessions())
                 except Exception as _claude_err:
