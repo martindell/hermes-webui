@@ -84,7 +84,11 @@ _CLI_SESSIONS_CACHE_MAX_ENTRIES = 8
 # Last successful projection by a stable identity. The normal cache key includes
 # volatile state.db fingerprints, so an unavailable DB can otherwise make the
 # known-good entry unfindable. Values are (invalidation generation, rows).
-_CLI_SESSIONS_LAST_KNOWN_GOOD: "dict[tuple, tuple]" = {}
+# LRU-bounded like the primary cache above: the stable identity still includes
+# Claude-project and session-index stat stamps, so normal external churn can
+# mint new identities indefinitely and this store needs its own drop-oldest cap.
+_CLI_SESSIONS_LAST_KNOWN_GOOD: "collections.OrderedDict[tuple, tuple]" = collections.OrderedDict()
+_CLI_SESSIONS_LAST_KNOWN_GOOD_MAX_ENTRIES = 8
 _CLI_SESSIONS_CACHE_WAIT_SECONDS = 0.25
 # Event waits that keep stale rows visible while a rebuild is in flight.
 _CLI_SESSIONS_CACHE_STALE_WAIT_SECONDS = 0.10
@@ -7269,6 +7273,8 @@ def _copy_last_known_good_cli_sessions(stable_key: tuple, invalidation_stamp: in
         entry = _CLI_SESSIONS_LAST_KNOWN_GOOD.get(stable_key)
         if entry is None or entry[0] != invalidation_stamp:
             return None
+        # LRU: a fresh hit is the most-recently-used entry.
+        _CLI_SESSIONS_LAST_KNOWN_GOOD.move_to_end(stable_key)
         return _copy_cli_sessions(entry[1])
 
 
@@ -7291,6 +7297,14 @@ def _cache_cli_sessions_if_current(
             invalidation_stamp,
             _copy_cli_sessions(copied_sessions),
         )
+        _CLI_SESSIONS_LAST_KNOWN_GOOD.move_to_end(
+            _cli_sessions_stable_cache_identity(cache_key)
+        )
+        while (
+            len(_CLI_SESSIONS_LAST_KNOWN_GOOD)
+            > _CLI_SESSIONS_LAST_KNOWN_GOOD_MAX_ENTRIES
+        ):
+            _CLI_SESSIONS_LAST_KNOWN_GOOD.popitem(last=False)
         _CLI_SESSIONS_CACHE.move_to_end(cache_key)
         while len(_CLI_SESSIONS_CACHE) > _CLI_SESSIONS_CACHE_MAX_ENTRIES:
             _CLI_SESSIONS_CACHE.popitem(last=False)
