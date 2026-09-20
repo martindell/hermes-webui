@@ -8280,8 +8280,9 @@ def get_cli_sessions(
                     # this partial aggregate from entering either cache.
                     unavailable_error = _profile_err
                     logger.warning(
-                        "get_cli_sessions() skipped unavailable profile %s: %s",
+                        "get_cli_sessions() skipped unavailable profile %s at %s: %s",
                         ctx_profile or 'default',
+                        ctx_db_path,
                         _profile_err,
                     )
             external_complete = True
