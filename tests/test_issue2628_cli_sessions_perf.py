@@ -533,7 +533,15 @@ def test_all_profiles_incomplete_load_prefers_stale_primary_over_evicted_lkg(mon
         expires, stamp, cached = models._CLI_SESSIONS_CACHE[cache_key]
         models._CLI_SESSIONS_CACHE[cache_key] = (0.0, stamp, cached)
         models._CLI_SESSIONS_LAST_KNOWN_GOOD.clear()
+    mode[0] = "failed"
+    calls = []
+    original_loader = models._load_cli_sessions_uncached
+    def failing_loader(*args, **kwargs):
+        calls.append(True)
+        return original_loader(*args, **kwargs)
+    monkeypatch.setattr(models, "_load_cli_sessions_uncached", failing_loader)
     assert models.get_cli_sessions(all_profiles=True) == rows
+    assert calls == [True]
 
 
 def test_all_profiles_filtered_load_excludes_global_claude_on_first_load_and_cache_hit(monkeypatch, tmp_path):
