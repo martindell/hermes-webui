@@ -6,6 +6,14 @@ import signal
 import socket
 import ssl
 import sys
+from pathlib import Path
+
+# Hermes Agent's managed-interpreter relaunch executes this file with runpy,
+# which does not add the WebUI repository directory to sys.path.
+_REPO_ROOT = Path(__file__).resolve().parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 import threading
 import time
 import traceback

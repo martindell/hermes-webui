@@ -250,7 +250,11 @@ def discover_launcher_python(agent_dir: Path | None) -> str:
 
 
 def _python_can_run_webui_and_agent(python_exe: str, agent_dir: Path | None = None) -> bool:
-    script = "import yaml\nfrom run_agent import AIAgent\n"
+    # Importing run_agent here triggers Hermes Agent's managed-interpreter
+    # relaunch path, which intentionally runs isolated and hides WebUI deps.
+    # The server resolves the agent through HERMES_WEBUI_AGENT_DIR later;
+    # bootstrap only needs to validate the WebUI interpreter's dependencies.
+    script = "import yaml\n"
     env = os.environ.copy()
     if agent_dir:
         # PREPEND agent_dir to PYTHONPATH so an `agent_dir/run_agent.py` wins
@@ -570,7 +574,12 @@ def main() -> int:
         install_hermes_agent()
         agent_dir = discover_agent_dir()
 
-    python_exe = ensure_python_has_webui_deps(discover_launcher_python(agent_dir), agent_dir)
+    local_python = REPO_ROOT / ".venv" / ("Scripts/python.exe" if platform.system() == "Windows" else "bin/python")
+    # Prefer the WebUI-local interpreter when present. The Hermes Agent launcher
+    # performs its own isolated source relaunch, which is not suitable for
+    # running server.py via runpy (it omits the WebUI repository from sys.path).
+    initial_python = str(local_python) if local_python.exists() else discover_launcher_python(agent_dir)
+    python_exe = ensure_python_has_webui_deps(initial_python, agent_dir)
     state_dir = Path(
         os.getenv("HERMES_WEBUI_STATE_DIR")
         or Path(os.getenv("HERMES_HOME") or (Path.home() / ".hermes")) / "webui"
@@ -580,6 +589,10 @@ def main() -> int:
     # Mutate os.environ so child (or post-execv) inherits the resolved values.
     os.environ["HERMES_WEBUI_HOST"] = args.host
     os.environ["HERMES_WEBUI_PORT"] = str(args.port)
+    # The WebUI is not the Hermes Agent CLI; prevent the agent's source
+    # bootstrap from attempting a managed dependency relaunch while importing
+    # AIAgent for server-side chat support.
+    os.environ.setdefault("HERMES_DISABLE_LAZY_INSTALLS", "1")
     os.environ.setdefault("HERMES_WEBUI_STATE_DIR", str(state_dir))
     if agent_dir:
         os.environ["HERMES_WEBUI_AGENT_DIR"] = str(agent_dir)
